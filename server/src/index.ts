@@ -1,5 +1,6 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, setEquipmentStatus, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { TELEMETRY_RULES, affectedTasks, evaluateAll, healthOverview, healthTimeline, ingestHeartbeats, listExceptions, resolveException } from './telemetry.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -16,10 +17,19 @@ app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(cr
 app.patch('/api/gate/appointments/:id', (req, res) => { try { const result = editGateAppointment(req.params.id, req.body); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新预约失败' }); } });
 app.delete('/api/gate/appointments/:id', (req, res) => { const result = deleteGateAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json({ deleted: true, id: result.id }); });
 app.get('/api/equipment', (_req, res) => res.json(equipment));
+app.patch('/api/equipment/:id', (req, res) => { try { const result = setEquipmentStatus(req.params.id, req.body.status); if (!result) return res.status(404).json({ message: '设备不存在' }); evaluateAll(); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新设备状态失败' }); } });
+app.post('/api/telemetry/heartbeats', (req, res) => { try { res.json(ingestHeartbeats(req.body)); } catch (error) { res.status(400).json({ message: error instanceof Error ? error.message : '心跳批次受理失败' }); } });
+app.get('/api/telemetry/rules', (_req, res) => res.json(TELEMETRY_RULES));
+app.get('/api/telemetry/overview', (_req, res) => res.json(healthOverview()));
+app.get('/api/telemetry/timeline', (req, res) => res.json(healthTimeline(typeof req.query.equipmentId === 'string' ? req.query.equipmentId : undefined)));
+app.get('/api/telemetry/exceptions', (req, res) => res.json(listExceptions(req.query.status === 'open' || req.query.status === 'resolved' ? req.query.status : undefined)));
+app.post('/api/telemetry/exceptions/:id/resolve', (req, res) => { try { const result = resolveException(req.params.id, req.body.action); if (!result) return res.status(404).json({ message: '异常不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '异常处置失败' }); } });
+app.get('/api/telemetry/affected-tasks', (_req, res) => res.json(affectedTasks()));
 app.get('/api/tasks', (_req, res) => res.json(prioritizeTasks()));
 app.post('/api/tasks', (req, res) => { try { res.status(201).json(createYardTask(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '创建作业任务失败' }); } });
 app.patch('/api/tasks/:id', (req, res) => { try { const result = updateYardTask(req.params.id, req.body); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新作业任务失败' }); } });
 app.delete('/api/tasks/:id', (req, res) => { const result = deleteYardTask(req.params.id); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json({ deleted: true, id: result.id }); });
 app.patch('/api/tasks/:id/assign', (req, res) => { const result = assignTask(req.params.id, req.body.equipmentId); if (!result) return res.status(404).json({ message: '任务或设备不存在' }); res.json(result); });
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'port-yard-operations' }));
+setInterval(() => evaluateAll(), 10_000).unref();
 const port = Number(process.env.PORT || 4107); app.listen(port, () => console.log(`port yard API listening on ${port}`));

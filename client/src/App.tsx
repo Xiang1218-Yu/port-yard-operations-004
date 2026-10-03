@@ -8,11 +8,17 @@ type Conflict = { severity: string; appointmentId: string; reason: string };
 type Appointment = { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup'|'dropoff'; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; status: string; exception?: string };
 type Task = { id: string; kind: string; containerId: string; from: string; to: string; equipmentId?: string; priority: number; score: number; status: string; blockingReasons: string[]; estimatedMinutes: number; scheduledAt: string };
 type Equipment = { id: string; name: string; kind: string; status: string; location: string; battery: number; queue: number; movesPerHour: number };
-type Section = 'control'|'containers'|'gate'|'yard'|'tasks';
+type DeviceHealth = { equipmentId: string; name: string; kind: string; equipmentStatus: string; health: 'healthy'|'degraded'|'stale'|'offline'; risks: { code: string; detail: string }[]; battery?: number; lastHeartbeatAt?: string; lastPosition?: string; silentForMs: number | null; openExceptions: number; pendingReassign: number };
+type HealthEvent = { id: string; equipmentId: string; from: string; to: string; at: string; reason: string };
+type TaskException = { id: string; taskId: string; equipmentId: string; reason: string; createdAt: string; status: 'open'|'resolved'; resolution?: string; resolvedAt?: string };
+type AffectedTask = { id: string; kind: string; containerId: string; from: string; to: string; equipmentId?: string; status: string; blockingReasons: string[]; exception?: TaskException };
+type IngestResult = { batchId: string; duplicate: boolean; accepted: number; duplicates: number; expired: number; future: number; unknown: number; invalid: number };
+type Section = 'control'|'containers'|'gate'|'yard'|'telemetry'|'tasks';
 type Editor = { entity: 'container'|'appointment'|'task'; mode: 'create'|'edit'; id?: string; values: Record<string, string|boolean> };
 
 const api = '/api';
 const pct = (value: number) => `${Math.round(value * 100)}%`;
+const healthLabel: Record<string, string> = { healthy: '正常', degraded: '风险', stale: '失联', offline: '维护/离线' };
 const time = (value: string) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const toLocalInput = (value?: string) => {
   const date = value ? new Date(value) : new Date(Date.now() + 30 * 60000);
@@ -40,6 +46,10 @@ export default function App() {
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [equipment, setEquipment] = useState<Equipment[]>([]);
+  const [deviceHealth, setDeviceHealth] = useState<DeviceHealth[]>([]);
+  const [timeline, setTimeline] = useState<HealthEvent[]>([]);
+  const [exceptions, setExceptions] = useState<TaskException[]>([]);
+  const [affected, setAffected] = useState<AffectedTask[]>([]);
   const [tab, setTab] = useState<Section>('control');
   const [selectedVoyage, setSelectedVoyage] = useState('VOY-AX7');
   const [editor, setEditor] = useState<Editor>();
@@ -48,14 +58,17 @@ export default function App() {
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
-    const [d, v, ctn, b, cf, a, t, e] = await Promise.all([
+    const [d, v, ctn, b, cf, a, t, e, dh, tl, ex, af] = await Promise.all([
       request<Dashboard>('/dashboard'), request<Voyage[]>('/voyages'), request<Container[]>('/containers'),
       request<Block[]>('/yard/heatmap'), request<Conflict[]>('/gate/conflicts'), request<Appointment[]>('/gate/appointments'),
-      request<Task[]>('/tasks'), request<Equipment[]>('/equipment')
+      request<Task[]>('/tasks'), request<Equipment[]>('/equipment'), request<DeviceHealth[]>('/telemetry/overview'),
+      request<HealthEvent[]>('/telemetry/timeline'), request<TaskException[]>('/telemetry/exceptions'), request<AffectedTask[]>('/telemetry/affected-tasks')
     ]);
     setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e);
+    setDeviceHealth(dh); setTimeline(tl); setExceptions(ex); setAffected(af);
   }, []);
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }, [load]);
+  useEffect(() => { const timer = setInterval(() => { void load().catch(() => undefined); }, 20_000); return () => clearInterval(timer); }, [load]);
 
   const mutate = async (path: string, method: string, body?: unknown) => {
     setBusy(true); setError('');
@@ -93,6 +106,36 @@ export default function App() {
   };
   const updateAppointmentStatus = async (id: string, status: string) => mutate(`/gate/appointments/${id}`, 'PATCH', { status });
   const assign = async (id: string, equipmentId: string) => equipmentId ? mutate(`/tasks/${id}/assign`, 'PATCH', { equipmentId }) : mutate(`/tasks/${id}`, 'PATCH', { equipmentId: '', status: 'queued' });
+  const postHeartbeat = async (readings: Record<string, unknown>[], note: string) => {
+    setBusy(true); setError('');
+    try {
+      const result = await request<IngestResult>('/telemetry/heartbeats', { method: 'POST', body: JSON.stringify({ batchId: crypto.randomUUID(), readings }) });
+      setMessage(`${note}：采纳 ${result.accepted} · 重复 ${result.duplicates} · 过期 ${result.expired}${result.future + result.unknown + result.invalid ? ` · 拒收 ${result.future + result.unknown + result.invalid}` : ''}`);
+      await load();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '心跳上报失败'); }
+    finally { setBusy(false); }
+  };
+  const simulateBatch = () => {
+    const now = Date.now();
+    const readings: Record<string, unknown>[] = [];
+    equipment.filter(item => item.status === 'working' || item.status === 'available').forEach(item => {
+      if (item.id === 'TT-31') {
+        readings.push(
+          { messageId: crypto.randomUUID(), equipmentId: item.id, recordedAt: new Date(now - 4 * 60000).toISOString(), battery: 60, position: item.location },
+          { messageId: crypto.randomUUID(), equipmentId: item.id, recordedAt: new Date(now - 2 * 60000).toISOString(), battery: 48, position: item.location },
+          { messageId: crypto.randomUUID(), equipmentId: item.id, recordedAt: new Date(now).toISOString(), battery: 35, position: item.location }
+        );
+      } else {
+        readings.push({ messageId: crypto.randomUUID(), equipmentId: item.id, recordedAt: new Date(now).toISOString(), battery: Math.max(5, item.battery - 1), position: item.location });
+      }
+    });
+    if (readings.length) readings.push({ ...readings[0] });
+    if (equipment[0]) readings.push({ messageId: crypto.randomUUID(), equipmentId: equipment[0].id, recordedAt: new Date(now - 30 * 60000).toISOString(), battery: 50 });
+    void postHeartbeat(readings, '模拟批次已受理（含重复与过期心跳）');
+  };
+  const sendHeartbeat = (device: DeviceHealth) => void postHeartbeat([{ messageId: crypto.randomUUID(), equipmentId: device.equipmentId, recordedAt: new Date().toISOString(), battery: device.battery, position: device.lastPosition }], `${device.name} 新鲜心跳已上报`);
+  const resolveException = async (id: string, action: string) => mutate(`/telemetry/exceptions/${id}/resolve`, 'POST', { action });
+  const changeEquipmentStatus = async (id: string, status: string) => mutate(`/equipment/${id}`, 'PATCH', { status });
   const selected = voyages.find(voyage => voyage.id === selectedVoyage);
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
@@ -104,11 +147,37 @@ export default function App() {
     <header><div><div className="eyebrow">PORT OPS / YARD & GATE CONTROL</div><h1>HarborGrid <span>港口集装箱堆场协同与闸口调度</span></h1><p>把船期、箱务、堆场容量、危险品/冷藏约束、闸口预约与场内设备任务放在同一条作业链路上。</p></div><div className="header-right"><span className="live"><i/> TOS LINKED</span><span className="clock">LIVE · {new Date().toLocaleTimeString()}</span></div></header>
     {message && <div className="toast" onClick={() => setMessage('')}>{message} ×</div>}{error && <div className="form-error page-error">{error}<button onClick={() => setError('')}>关闭</button></div>}
     <section className="kpis"><div><small>ACTIVE VESSELS</small><b>{dashboard.activeVoyages}<em> 艘</em></b><span>{dashboard.lateVessels} 艘存在延误风险</span></div><div><small>YARD UTILIZATION</small><b>{pct(dashboard.yardUtilization)}</b><span>可用堆位 / 危险品隔离纳管</span></div><div><small>GATE QUEUE</small><b>{dashboard.gateQueue}<em> 车</em></b><span>预约、已进场与车道排队</span></div><div><small>EXCEPTIONS</small><b>{dashboard.blockedTasks + dashboard.reeferAlerts + dashboard.hazmatHolds}<em> 项</em></b><span>{dashboard.blockedTasks} 作业阻塞 · {dashboard.reeferAlerts} 冷藏告警</span></div></section>
-    <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
+    <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='telemetry'?'active':''} onClick={() => setTab('telemetry')}>设备遥测</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
     {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
+    {tab === 'telemetry' && <div className="layout">
+      <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">TELEMETRY / DEVICE HEALTH</div><h2>设备遥测与健康判定</h2><span className="muted">批量心跳 · 幂等去重 · 乱序容忍 · 过期心跳不计入恢复</span></div><button className="primary-action" disabled={busy} onClick={simulateBatch}>模拟心跳批次</button></div>
+        <div className="device-grid">{deviceHealth.map(device => <div className={`device-card ${device.health}`} key={device.equipmentId}>
+          <div className="device-top"><b>{device.name}</b><span className={`health-badge ${device.health}`}>{healthLabel[device.health]}</span></div>
+          <small>{device.kind} · {device.equipmentStatus} · 电量 {device.battery ?? '—'}%</small>
+          <small>最近心跳 {device.lastHeartbeatAt ? time(device.lastHeartbeatAt) : '无'}{device.silentForMs != null && device.silentForMs > 60_000 ? ` · 已静默 ${Math.round(device.silentForMs / 60000)} 分钟` : ''}</small>
+          <small>上报位置 {device.lastPosition ?? '—'}{device.pendingReassign ? ` · ${device.pendingReassign} 任务待重派` : ''}</small>
+          {device.risks.map(risk => <div className="risk" key={risk.code}>{risk.detail}</div>)}
+          <div className="row-actions"><button disabled={busy} onClick={() => sendHeartbeat(device)}>上报心跳</button><select value={device.equipmentStatus} onChange={event => void changeEquipmentStatus(device.equipmentId, event.target.value)}>{['available','working','maintenance','offline'].map(value => <option key={value} value={value}>{value}</option>)}</select></div>
+        </div>)}</div>
+      </section>
+      <section className="panel"><div className="panel-head"><h3>健康时间线</h3><span>{timeline.length} events</span></div>
+        {timeline.slice(0, 14).map(event => <div className="timeline-row" key={event.id}><i className={`equip-dot ${event.to}`}/><div><b>{event.equipmentId} · {healthLabel[event.from]} → {healthLabel[event.to]}</b><small>{time(event.at)} · {event.reason}</small></div></div>)}
+        {!timeline.length && <p className="muted">暂无健康状态变化，设备全部正常。</p>}
+      </section>
+      <section className="panel"><div className="panel-head"><h3>受影响任务与异常确认</h3><span>{affected.length} affected</span></div>
+        {exceptions.filter(item => item.status === 'open').map(exception => <div className="exception-card" key={exception.id}>
+          <b>{exception.taskId} · {exception.equipmentId}</b><span>{exception.reason}</span>
+          <div className="row-actions"><button disabled={busy} onClick={() => void resolveException(exception.id, 'resume')}>恢复执行</button><button disabled={busy} onClick={() => void resolveException(exception.id, 'reassign')}>转待重派</button><button className="danger-action" disabled={busy} onClick={() => void resolveException(exception.id, 'complete')}>确认完成</button></div>
+        </div>)}
+        <div className="table affected-table"><div className="tr th"><span>任务</span><span>箱号</span><span>路径</span><span>状态</span></div>
+          {affected.map(task => <div className="tr" key={task.id}><span><b>{task.id}</b><small>{task.kind} · {task.equipmentId ?? '未指派'}</small></span><span>{task.containerId}</span><span>{task.from} → {task.to}</span><span><span className={`pill ${task.status}`}>{task.status}</span>{task.blockingReasons.length>0&&<small className="blocked-text">{task.blockingReasons[task.blockingReasons.length-1]}</small>}</span></div>)}
+          {!affected.length && <p className="muted">没有待重派任务或待确认异常。</p>}
+        </div>
+      </section>
+    </div>}
     {tab === 'tasks' && <div className="layout"><section className="panel wide"><div className="panel-head"><div><div className="eyebrow">TASK DISPATCH / EQUIPMENT POOL</div><h2>场内任务优先级与设备指派</h2><span className="muted">支持新增、编辑、删除和设备指派</span></div><button className="primary-action" onClick={() => openCreate('task')}>＋ 新建任务</button></div><div className="table task-table"><div className="tr th"><span>任务</span><span>箱号</span><span>路径</span><span>优先级</span><span>状态</span><span>设备 / 操作</span></div>{tasks.map(task => <div className="tr" key={task.id}><span><b>{task.id}</b><small>{task.kind} · {task.estimatedMinutes}min</small></span><span>{task.containerId}</span><span>{task.from} → {task.to}</span><span className={task.score>95?'critical':''}>{task.score}</span><span><span className={`pill ${task.status}`}>{task.status}</span>{task.blockingReasons.length>0&&<small className="blocked-text">{task.blockingReasons[0]}</small>}</span><span className="task-actions"><select value={task.equipmentId??''} onChange={event => void assign(task.id, event.target.value)}><option value="">未指派</option>{equipment.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => openEdit('task', task.id, { kind: task.kind, containerId: task.containerId, from: task.from, to: task.to, equipmentId: task.equipmentId ?? '', priority: String(task.priority), estimatedMinutes: String(task.estimatedMinutes), scheduledAt: toLocalInput(task.scheduledAt), status: task.status })}>编辑</button><button className="danger-action" onClick={() => void remove('task', task.id)}>删除</button></span></div>)}</div></section><section className="panel"><div className="panel-head"><h3>设备池</h3><span>{equipment.length} assets</span></div>{equipment.map(item => <div className="equipment" key={item.id}><i className={`equip-dot ${item.status}`}/><div><b>{item.name}</b><small>{item.location} · 队列 {item.queue}</small></div><strong>{item.battery}%</strong></div>)}</section></div>}
     <footer>HarborGrid · 内存种子数据 + REST API · 箱务台账、闸口预约、场内任务提供完整增删改查操作</footer>
     {editor && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setEditor(undefined); }}><form className="editor-modal" onSubmit={saveEditor}><div className="modal-head"><div><div className="eyebrow">{editor.mode.toUpperCase()} / {editor.entity.toUpperCase()}</div><h2>{editor.mode==='create'?'创建':'编辑'}{editor.entity==='container'?'箱务记录':editor.entity==='appointment'?'闸口预约':'作业任务'}</h2></div><button type="button" className="icon-button" onClick={() => setEditor(undefined)}>×</button></div>
@@ -140,7 +209,7 @@ export default function App() {
         <label>起点<input required value={String(editor.values.from)} onChange={event => updateField('from', event.target.value)}/></label><label>终点<input required value={String(editor.values.to)} onChange={event => updateField('to', event.target.value)}/></label>
         <label>优先级 (1–100)<input type="number" min="1" max="100" required value={String(editor.values.priority)} onChange={event => updateField('priority', event.target.value)}/></label><label>预计时长 (分钟)<input type="number" min="1" required value={String(editor.values.estimatedMinutes)} onChange={event => updateField('estimatedMinutes', event.target.value)}/></label>
         <label>计划时间<input type="datetime-local" required value={String(editor.values.scheduledAt)} onChange={event => updateField('scheduledAt', event.target.value)}/></label><label>指派设备<select value={String(editor.values.equipmentId)} onChange={event => updateField('equipmentId', event.target.value)}><option value="">暂不指派</option>{equipment.map(item => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select></label>
-        {editor.mode==='edit' && <label>任务状态<select value={String(editor.values.status)} onChange={event => updateField('status', event.target.value)}>{['queued','assigned','executing','blocked','done'].map(value => <option key={value} value={value}>{value}</option>)}</select></label>}
+        {editor.mode==='edit' && <label>任务状态<select value={String(editor.values.status)} onChange={event => updateField('status', event.target.value)}>{['queued','assigned','executing','blocked','pending-reassign','done'].map(value => <option key={value} value={value}>{value}</option>)}</select></label>}
       </div>}
       {error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" onClick={() => setEditor(undefined)}>取消</button><button className="primary-action" disabled={busy}>{busy?'保存中…':'保存'}</button></div>
     </form></div>}
